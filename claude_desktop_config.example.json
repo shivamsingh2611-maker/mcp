@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "telekom-commerce-demo": {
+      "command": "/absolute/path/to/.venv/bin/python",
+      "args": ["/absolute/path/to/server.py"]
+    }
+  }
+}
