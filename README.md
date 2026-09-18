@@ -22,6 +22,7 @@ pip install -r requirements.txt
 
 python server.py                      # stdio, for a local desktop client
 python server.py --http --port 8000   # remote, for a custom connector
+python server.py --http --no-mcp-ui   # ...without the in-band ui:// widget
 ```
 
 The HTTP endpoint is `http://127.0.0.1:8000/mcp`.
@@ -77,15 +78,62 @@ upgrade the Render service to a paid instance (still the same `render.yaml`).
 ## Connect it
 
 **Claude** — Settings → Connectors → Add custom connector → paste the `/mcp` URL.
-Widgets render, and the three prompt templates appear in the prompt picker.
+All nine tools and the three prompt templates work. The MCP Apps widget does
+*not* render (see "Where the UI renders" below); the priced tables come through
+as `display_markdown` instead.
 
-**ChatGPT** — Settings → Connectors → Create, same URL. Tools work; widget support
-depends on your workspace's Apps SDK settings.
+**ChatGPT** — Settings → Connectors → Create, same URL. Same position as Claude:
+tools work, widget rendering depends on Apps SDK support in your workspace.
 
 **Gemini** — add as an MCP server in the Gemini CLI or any UCP/MCP-capable client.
 
 **Any client** — `npx @mcpjam/inspector@latest` and point it at the URL. Best way
-to watch the raw JSON-RPC while you demo.
+to watch the raw JSON-RPC while you demo, and the easiest place to see a widget
+actually painted.
+
+## Where the UI renders
+
+The server emits its widgets two different ways, because no single mechanism
+renders everywhere today:
+
+| Mechanism | How it travels | Renders in |
+|---|---|---|
+| MCP Apps (SEP-2133) | `_meta.ui.resourceUri` on the tool + a separate `ui://` resource, gated by capability negotiation | Nothing yet — the `extensions` capability is only carried on wire revision `2026-07-28`, which the `initialize` handshake cannot reach, so `client_supports_apps()` is false in Claude and ChatGPT |
+| MCP-UI (in-band) | an `EmbeddedResource` with a `ui://` URI and `text/html`, inside the tool result's own `content` | MCP-UI-aware clients (MCPJam inspector, Goose, custom web chat) |
+| `display_markdown` | a plain field in every tool result | Everywhere, including voice |
+
+The in-band copy is a complete, standalone HTML document with that call's data
+already baked in, so it needs no postMessage bridge from the host. Disable it
+with `--no-mcp-ui` or `TELEKOM_MCP_UI=0` if a client dumps the raw HTML into the
+transcript instead of rendering it.
+
+Verify what a client is actually getting:
+
+```bash
+curl -s -X POST https://<service>.onrender.com/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -H 'mcp-session-id: <id from initialize>' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_tariffs","arguments":{"line_type":"mobile"}}}'
+```
+
+## The display contract
+
+Every tool returns two extra fields, and they are what keeps pricing under
+Telekom's control rather than the model's:
+
+- **`display_markdown`** — the priced table as Telekom words it, rendered
+  server-side, including the minimum-term and post-term footnotes.
+- **`display_note`** — what the model should do with it, decided per request:
+  when the client negotiated MCP Apps, "the widget shows this, don't restate
+  prices"; otherwise "show `display_markdown` verbatim".
+
+Tool descriptions and the server instructions carry the price-integrity rules:
+prices are euro cents and authoritative as returned, never summed or rounded by
+the model; MagentaEINS is a conditional saving, never an applied one; a payment
+token is an authorisation, not a completed payment.
+
+Voice surfaces get `*_spoken` variants (`monthly_spoken`, `monthly_total_spoken`)
+so "€39.95" is read as "39 euro 95" rather than digit by digit.
 
 ## Driving the demo
 
@@ -110,15 +158,17 @@ search_tariffs → get_tariff_details → search_devices → get_device_details
 
 ## What to point at while presenting
 
-**The widgets are ours.** Every tool carries `_meta.ui.resourceUri` pointing at a
-`ui://` resource. The host renders our HTML in a sandboxed iframe and instructs the
-model not to restate its contents, so price and product appear as Telekom authored
-them rather than as a language model's summary. Each tool result also carries a
-`display_note` saying so.
+**The presentation is ours, on every surface.** Price and product reach the
+customer as Telekom authored them, not as a language model's paraphrase — as a
+rendered widget where the client supports one, and as server-rendered
+`display_markdown` everywhere else. The model is told which, per request.
 
-**It degrades.** A client that doesn't negotiate the MCP Apps extension still gets
-all nine tools and readable structured output. Verified — the tools are registered
-on the server, not hidden behind the extension.
+**It degrades honestly.** SEP-2133 requires a UI-bound tool to still be useful
+without the extension. `respond()` in `server.py` branches on
+`client_supports_apps()`: widget present, suppress prose; no widget, print the
+server's own markdown. The failure mode this avoids is the demo telling the
+model "the widget already shows the price" when nothing is on screen — which
+silently hides pricing.
 
 **Cards only, and the server says why.** `get_payment_methods` returns SEPA as
 `unsupported` with the reason attached: a card credential can be tokenised and
