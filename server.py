@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -22,14 +23,19 @@ from pathlib import Path
 from typing import Any
 
 import segno
-from mcp.server.apps import Apps, ResourceCsp
-from mcp.server.mcpserver import MCPServer
-from mcp.types import ToolAnnotations
+from mcp.server.apps import Apps, ResourceCsp, client_supports_apps
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.types import CallToolResult, EmbeddedResource, TextContent, TextResourceContents, ToolAnnotations
 
 HERE = Path(__file__).parent
 CATALOGUE = HERE / "catalogue"
 
 APP_DOWNLOAD_URL = "https://www.telekom.de/meinmagenta-app"
+
+# Emit the widget a second time as an in-band embedded `ui://` resource, which is
+# how MCP-UI clients render. Costs a few KB per call on clients that ignore it;
+# set TELEKOM_MCP_UI=0 to send structured output only.
+MCP_UI_ENABLED = os.environ.get("TELEKOM_MCP_UI", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # --------------------------------------------------------------------------
 # Markdown catalogue parsing
@@ -67,6 +73,16 @@ def as_int(value: str | None, default: int = 0) -> int:
 
 def money(cents: int) -> str:
     return f"€{cents / 100:,.2f}"
+
+
+def money_spoken(cents: int) -> str:
+    """A price a text-to-speech surface can read without mangling it.
+
+    "€39.95" read literally becomes "euro thirty nine point nine five"; voice
+    surfaces get "39 euro 95" instead.
+    """
+    euros, rest = divmod(abs(int(cents)), 100)
+    return f"{euros} euro" if rest == 0 else f"{euros} euro {rest:02d}"
 
 
 TARIFFS = parse_blocks(CATALOGUE / "tariffs.md")
@@ -495,6 +511,177 @@ function render(d){
 )
 
 
+# --------------------------------------------------------------------------
+# Display layer
+# --------------------------------------------------------------------------
+#
+# Almost no client can render the MCP Apps widget today: the extension is only
+# advertised on wire revisions the `initialize` handshake cannot reach, so
+# `client_supports_apps()` is False nearly everywhere. SEP-2133 requires a
+# UI-bound tool to degrade gracefully, so every tool also returns
+# `display_markdown` — Telekom's own rendering of the same figures — and tells
+# the model to print that verbatim instead of paraphrasing prices.
+
+WIDGET_HTML: dict[str, str] = {str(b.resource.uri): b.resource.text for b in apps.resources()}
+
+
+def live_widget(uri: str, data: Any) -> str:
+    """Re-render a registered widget document with this call's data baked in.
+
+    The registered copy carries a build-time catalogue snapshot as `FALLBACK`;
+    swapping that for the live payload makes the document correct standalone, so
+    it renders in clients that never deliver tool output into the iframe.
+    """
+    head, marker, rest = WIDGET_HTML[uri].partition("const FALLBACK=")
+    _snapshot, terminator, tail = rest.partition(";\n")
+    return head + marker + json.dumps(data) + terminator + tail
+
+
+PRICE_RULES = ("Prices are euro cents and authoritative exactly as returned. Never sum components, "
+               "apply a discount, or round them yourself.")
+
+
+def respond(ctx: Context, payload: dict[str, Any], *, uri: str, markdown: str,
+            widget_data: Any) -> dict[str, Any] | CallToolResult:
+    """Attach the display contract, plus the widget itself where it can render."""
+    payload = dict(payload)
+    payload["display_markdown"] = markdown
+    payload["display_note"] = (
+        "The widget already shows this. Do not restate prices in prose."
+        if client_supports_apps(ctx) else
+        "No widget is on screen in this client. Show the customer display_markdown "
+        "verbatim — it is Telekom's own rendering. " + PRICE_RULES
+    )
+    if not MCP_UI_ENABLED:
+        return payload
+    return CallToolResult(
+        content=[
+            TextContent(type="text", text=json.dumps(payload, ensure_ascii=False)),
+            EmbeddedResource(
+                type="resource",
+                resource=TextResourceContents(
+                    uri=uri, mime_type="text/html", text=live_widget(uri, widget_data),
+                ),
+            ),
+        ],
+        structured_content=payload,
+    )
+
+
+FOOTER_TARIFF = "_Minimum term applies · prices incl. VAT · price changes after the minimum term._"
+
+
+def md_tariff_rows(rows: list[dict[str, Any]], title: str) -> str:
+    if not rows:
+        return f"**{title}**\n\nNo tariffs matched those filters."
+    out = [f"**{title}**", "", "| Tariff | Data | Per month | After 24 months |", "|---|---|---|---|"]
+    for t in rows:
+        gb = t.get("data_gb") or 0
+        data = ("Unlimited" if t.get("line_type") == "mobile" else "—") if gb == 0 else f"{gb} GB"
+        out.append(f"| {t['name']} | {data} | {money(t['monthly_initial'])} "
+                   f"| {money(t['monthly_after_24'])} |")
+    return "\n".join(out + ["", FOOTER_TARIFF])
+
+
+def md_tariff_detail(t: dict[str, Any]) -> str:
+    term = t["term_months"]
+    out = [f"**{t['name']}**", "",
+           f"| | |", "|---|---|",
+           f"| Months 1–{term} | {money(t['monthly_initial'])} per month |",
+           f"| From month {term + 1} | {money(t['monthly_after_24'])} per month |",
+           f"| One-off charge | {money(t['one_off'])} |",
+           f"| Minimum term | {term} months |",
+           f"| Speed | {t.get('speed', '—')} |",
+           "", f"Included: {t.get('extras', '—')}", "", f"Roaming: {t.get('roaming', '—')}"]
+    if t.get("magenta_eins_discount"):
+        out += ["", f"MagentaEINS: adding a Telekom fixed line reduces this by "
+                    f"{money(t['magenta_eins_discount'])} per month."]
+    return "\n".join(out + ["", FOOTER_TARIFF])
+
+
+def md_devices(rows: list[dict[str, Any]], title: str) -> str:
+    if not rows:
+        return f"**{title}**\n\nNo devices are available on this tariff."
+    out = [f"**{title}**", "", "| Device | Storage | Upfront | Per month |", "|---|---|---|---|"]
+    for d in rows:
+        flag = " _(backorder)_" if d.get("stock") == "backorder" else ""
+        monthly = f"+{money(d['monthly'])}" if d.get("monthly") else "included"
+        out.append(f"| {d['name']}{flag} | {d.get('storage', '—')} | {money(d.get('one_off', 0))} | {monthly} |")
+    return "\n".join(out + ["", "_Device instalment depends on the selected tariff._"])
+
+
+def md_device_detail(d: dict[str, Any]) -> str:
+    out = [f"**{d['name']} · {d.get('storage', '')}**".rstrip(), "",
+           f"{d.get('highlights', '')}", "",
+           "| | |", "|---|---|",
+           f"| Colour | {d.get('colour', '—')} |",
+           f"| Availability | {d.get('stock', '—')} |",
+           f"| Upfront | {money(d.get('one_off', 0))} |"]
+    for p in d.get("pricing", []):
+        monthly = f"+{money(p['monthly'])} / mo" if p.get("monthly") else "included"
+        out.append(f"| On {p['tariff']} | {monthly} |")
+    return "\n".join(out + ["", "_The same handset is priced differently on each tariff._"])
+
+
+def md_cart(cart: dict[str, Any]) -> str:
+    tot = cart.get("totals", {})
+    out = ["**Your cart**", "", "| Item | Per month |", "|---|---|"]
+    if cart.get("tariff"):
+        out.append(f"| {cart['tariff']['name']} | {money(cart['tariff']['monthly'])} |")
+    dev = cart.get("device")
+    if dev and dev.get("name") != "No device":
+        out.append(f"| {dev['name']} {dev.get('storage') or ''} | {money(dev['monthly'])} |".replace("  ", " "))
+    out.append(f"| **Monthly total** | **{money(tot.get('monthly', 0))}** |")
+    if tot.get("one_off"):
+        out.append(f"| One-off charges | {money(tot['one_off'])} |")
+    after = tot.get("monthly_after_24")
+    if after and after != tot.get("monthly"):
+        out += ["", f"From month 25 the monthly total becomes {money(after)}."]
+    if cart.get("magenta_eins_discount"):
+        out += ["", f"You qualify for MagentaEINS: adding a Telekom fixed line at your address "
+                    f"reduces this by {money(cart['magenta_eins_discount'])} per month."]
+    if cart.get("blockers"):
+        out += ["", "**Still needed before this order can be placed**"] + [f"- {b}" for b in cart["blockers"]]
+    return "\n".join(out)
+
+
+def md_payment(methods: list[dict[str, Any]], totals: dict[str, int], token: str | None) -> str:
+    out = ["**Payment method**", "", "| Method | Status |", "|---|---|"]
+    for m in methods:
+        out.append(f"| {m['label']} — {m['detail']} | {m.get('status', '')} |")
+    out += ["", f"Amount due: {money(totals.get('monthly', 0))} per month "
+                f"plus {money(totals.get('one_off', 0))} once."]
+    if token:
+        out += ["", f"Token `{token}` issued — scoped to this cart and merchant, single use. "
+                    "The agent never receives the card number."]
+    out += ["", "_SEPA Lastschrift is deliberately unavailable: a direct debit mandate is granted to "
+                "the creditor and cannot be delegated through an agent._"]
+    return "\n".join(out)
+
+
+def md_consents(items: list[dict[str, Any]], totals: dict[str, int]) -> str:
+    out = ["**Before you order**", ""]
+    for c in items:
+        box = "[x]" if c["granted"] else "[ ]"
+        tag = "" if c["mandatory"] else " _(optional)_"
+        out += [f"- {box} **{c['label']}**{tag} — {c['body']} ({c['statute']})"]
+    out += ["", f"Total: {money(totals.get('monthly', 0))} per month plus "
+                f"{money(totals.get('one_off', 0))} once.", "",
+            '_The order button is labelled "Zahlungspflichtig bestellen", the wording required by BGB §312j._']
+    return "\n".join(out)
+
+
+def md_order(order: dict[str, Any]) -> str:
+    out = [f"**Order {order['order_id']} confirmed**", "", order["summary"], "",
+           f"{money(order['monthly'])} per month · {money(order['one_off'])} one-off · {order['term']}", ""]
+    for line in order.get("status_lines", []):
+        out.append(f"- {'⏳' if line.get('pending') else '✅'} {line['text']}")
+    out += ["", "Your withdrawal period runs for 14 days from delivery. Confirmation and all contract "
+                "documents have been sent to you.",
+            "", "Scan the QR code in the order widget to install MeinMagenta and track this order."]
+    return "\n".join(out)
+
+
 # ---- tools ---------------------------------------------------------------
 
 READ = ToolAnnotations(readOnlyHint=True)
@@ -507,10 +694,12 @@ WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHin
     title="Search tariffs",
     description=("Find Telekom tariffs. line_type is 'mobile', 'fixed' or 'ott'. min_data_gb filters "
                  "mobile tariffs by allowance; max_monthly filters by monthly price in euro cents. "
-                 "Leave a filter empty when the customer has not stated it — do not guess."),
+                 "Leave a filter empty when the customer has not stated it — do not guess. "
+                 "Show the customer display_markdown as returned; never quote a monthly price that "
+                 "is not in it."),
     annotations=READ,
 )
-def search_tariffs(line_type: str = "", min_data_gb: int = 0, max_monthly: int = 0,
+def search_tariffs(ctx: Context, line_type: str = "", min_data_gb: int = 0, max_monthly: int = 0,
                    user_query: str = "") -> dict[str, Any]:
     """Search the tariff catalogue.
 
@@ -534,17 +723,19 @@ def search_tariffs(line_type: str = "", min_data_gb: int = 0, max_monthly: int =
             "headline": t.get("headline"), "speed": t.get("speed"),
             "data_gb": data, "monthly_initial": as_int(t.get("monthly_initial")),
             "monthly_after_24": as_int(t.get("monthly_after_24")),
+            "monthly_spoken": money_spoken(as_int(t.get("monthly_initial"))),
             "term_months": as_int(t.get("term_months")),
         })
     out.sort(key=lambda x: x["monthly_initial"])
     label = {"mobile": "Mobile tariffs", "fixed": "Home internet", "ott": "TV and streaming"}.get(line_type, "Telekom tariffs")
-    return {
+    payload = {
         "title": label,
         "tariffs": out,
         "currency": "eur",
         "next_step": "Call get_tariff_details for the one the customer is interested in.",
-        "display_note": "The widget already shows these tariffs and prices. Do not restate prices in prose.",
     }
+    return respond(ctx, payload, uri="ui://telekom/tariffs.html",
+                   markdown=md_tariff_rows(out, label), widget_data=payload)
 
 
 @apps.tool(
@@ -554,7 +745,7 @@ def search_tariffs(line_type: str = "", min_data_gb: int = 0, max_monthly: int =
     description="Full price breakdown for one tariff, including what changes after the minimum term.",
     annotations=READ,
 )
-def get_tariff_details(tariff_id: str) -> dict[str, Any]:
+def get_tariff_details(ctx: Context, tariff_id: str) -> dict[str, Any]:
     """Get the full detail of a single tariff.
 
     Args:
@@ -563,19 +754,23 @@ def get_tariff_details(tariff_id: str) -> dict[str, Any]:
     t = TARIFFS.get(tariff_id)
     if not t:
         return {"error": f"Unknown tariff_id {tariff_id!r}", "valid_ids": list(TARIFFS)}
-    return {
-        "tariff": {
-            "id": tariff_id, "name": t.get("name"), "line_type": t.get("line_type"),
-            "speed": t.get("speed"), "extras": t.get("extras"), "roaming": t.get("roaming"),
-            "monthly_initial": as_int(t.get("monthly_initial")),
-            "monthly_after_24": as_int(t.get("monthly_after_24")),
-            "one_off": as_int(t.get("one_off")), "term_months": as_int(t.get("term_months")),
-            "magenta_eins_discount": as_int(t.get("magenta_eins_discount")),
-            "device_eligible": t.get("device_eligible") == "true",
-        },
+    tariff = {
+        "id": tariff_id, "name": t.get("name"), "line_type": t.get("line_type"),
+        "speed": t.get("speed"), "extras": t.get("extras"), "roaming": t.get("roaming"),
+        "monthly_initial": as_int(t.get("monthly_initial")),
+        "monthly_after_24": as_int(t.get("monthly_after_24")),
+        "monthly_spoken": money_spoken(as_int(t.get("monthly_initial"))),
+        "one_off": as_int(t.get("one_off")), "term_months": as_int(t.get("term_months")),
+        "magenta_eins_discount": as_int(t.get("magenta_eins_discount")),
+        "device_eligible": t.get("device_eligible") == "true",
+    }
+    payload = {
+        "tariff": tariff,
         "next_step": ("Call search_devices with this tariff_id." if t.get("device_eligible") == "true"
                       else "This tariff has no device option. Call create_cart."),
     }
+    return respond(ctx, payload, uri="ui://telekom/tariff-detail.html",
+                   markdown=md_tariff_detail(tariff), widget_data=payload)
 
 
 @apps.tool(
@@ -583,10 +778,11 @@ def get_tariff_details(tariff_id: str) -> dict[str, Any]:
     name="search_devices",
     title="Search devices",
     description=("Devices available on a given tariff, priced for that tariff. Only mobile tariffs "
-                 "support devices."),
+                 "support devices. The same handset costs a different monthly instalment on each "
+                 "tariff, so never quote a device price without the tariff it belongs to."),
     annotations=READ,
 )
-def search_devices(tariff_id: str, brand: str = "", in_stock_only: bool = False) -> dict[str, Any]:
+def search_devices(ctx: Context, tariff_id: str, brand: str = "", in_stock_only: bool = False) -> dict[str, Any]:
     """List devices available on a tariff.
 
     Args:
@@ -612,14 +808,16 @@ def search_devices(tariff_id: str, brand: str = "", in_stock_only: bool = False)
         out.append({"id": did, "name": d.get("name"), "brand": d.get("brand"),
                     "storage": d.get("storage"), "colour": d.get("colour"),
                     "stock": d.get("stock"), "one_off": as_int(d.get("one_off")),
-                    "monthly": monthly})
+                    "monthly": monthly, "monthly_spoken": money_spoken(monthly)})
     out.sort(key=lambda x: x["monthly"])
-    return {
-        "title": f"Devices on {t.get('name')}",
+    title = f"Devices on {t.get('name')}"
+    payload = {
+        "title": title,
         "tariff_id": tariff_id, "devices": out, "currency": "eur",
         "next_step": "Call create_cart with tariff_id and device_id.",
-        "display_note": "The widget already shows these devices and prices. Do not restate prices in prose.",
     }
+    return respond(ctx, payload, uri="ui://telekom/devices.html",
+                   markdown=md_devices(out, title), widget_data=payload)
 
 
 @apps.tool(
@@ -629,7 +827,7 @@ def search_devices(tariff_id: str, brand: str = "", in_stock_only: bool = False)
     description="Full detail for one device, including how its instalment changes across tariffs.",
     annotations=READ,
 )
-def get_device_details(device_id: str) -> dict[str, Any]:
+def get_device_details(ctx: Context, device_id: str) -> dict[str, Any]:
     """Get the full detail of a single device.
 
     Args:
@@ -640,13 +838,16 @@ def get_device_details(device_id: str) -> dict[str, Any]:
         return {"error": f"Unknown device_id {device_id!r}", "valid_ids": list(DEVICES)}
     pricing = [{"tariff": TARIFFS[t].get("name"), "tariff_id": t, "monthly": m}
                for t, m in d["_monthly_map"].items() if t in TARIFFS]  # type: ignore[union-attr]
-    return {
-        "device": {"id": device_id, "name": d.get("name"), "brand": d.get("brand"),
-                   "storage": d.get("storage"), "colour": d.get("colour"),
-                   "stock": d.get("stock"), "one_off": as_int(d.get("one_off")),
-                   "highlights": d.get("highlights"), "pricing": pricing},
+    device = {"id": device_id, "name": d.get("name"), "brand": d.get("brand"),
+              "storage": d.get("storage"), "colour": d.get("colour"),
+              "stock": d.get("stock"), "one_off": as_int(d.get("one_off")),
+              "highlights": d.get("highlights"), "pricing": pricing}
+    payload = {
+        "device": device,
         "next_step": "Call create_cart with the chosen tariff_id and this device_id.",
     }
+    return respond(ctx, payload, uri="ui://telekom/device-detail.html",
+                   markdown=md_device_detail(device), widget_data=payload)
 
 
 @apps.tool(
@@ -654,10 +855,12 @@ def get_device_details(device_id: str) -> dict[str, Any]:
     name="create_cart",
     title="Create cart",
     description=("Create a server-side cart. Returns a cart_id; the agent holds only that ID and "
-                 "prices are recomputed here on every read."),
+                 "prices are recomputed here on every read. magenta_eins_discount is a conditional "
+                 "saving, not an applied one — describe it as available with a Telekom fixed line, "
+                 "never as already deducted from the totals."),
     annotations=WRITE,
 )
-def create_cart(tariff_id: str, device_id: str = "") -> dict[str, Any]:
+def create_cart(ctx: Context, tariff_id: str, device_id: str = "") -> dict[str, Any]:
     """Create a new cart.
 
     Args:
@@ -673,8 +876,9 @@ def create_cart(tariff_id: str, device_id: str = "") -> dict[str, Any]:
     cart = Cart(cart_id="crt_" + uuid.uuid4().hex[:8], tariff_id=tariff_id, device_id=device_id or None)
     CARTS[cart.cart_id] = cart
     pub = cart.public()
-    return {
+    payload = {
         "cart": pub, "show_customer": True,
+        "monthly_total_spoken": money_spoken(pub["totals"]["monthly"]),
         "suggested_additions": ([{"type": "bundle_discount", "product": "MagentaEINS",
                                   "saves_monthly": pub["magenta_eins_discount"],
                                   "condition": "add_fixed_line_same_address"}]
@@ -682,6 +886,8 @@ def create_cart(tariff_id: str, device_id: str = "") -> dict[str, Any]:
         "next_step": ("Call update_cart with the customer's name, date of birth, delivery address "
                       "and phone number. Ask for them conversationally, one or two at a time."),
     }
+    return respond(ctx, payload, uri="ui://telekom/cart.html",
+                   markdown=md_cart(pub), widget_data=payload)
 
 
 @apps.tool(
@@ -692,7 +898,7 @@ def create_cart(tariff_id: str, device_id: str = "") -> dict[str, Any]:
                  "full name, date of birth (YYYY-MM-DD), delivery address and phone number."),
     annotations=WRITE,
 )
-def update_cart(cart_id: str, tariff_id: str = "", device_id: str = "", name: str = "",
+def update_cart(ctx: Context, cart_id: str, tariff_id: str = "", device_id: str = "", name: str = "",
                 dob: str = "", address: str = "", phone: str = "") -> dict[str, Any]:
     """Update a cart's contents or the customer's checkout details.
 
@@ -731,9 +937,13 @@ def update_cart(cart_id: str, tariff_id: str = "", device_id: str = "", name: st
     for key, value in (("name", name), ("dob", dob), ("address", address), ("phone", phone)):
         if value:
             cart.customer[key] = value.strip()
-    return {"cart": cart.public(), "show_customer": True,
-            "next_step": ("Call get_payment_methods." if not cart.blockers()
-                          else "Resolve the blockers listed on the cart, then call get_payment_methods.")}
+    pub = cart.public()
+    payload = {"cart": pub, "show_customer": True,
+               "monthly_total_spoken": money_spoken(pub["totals"]["monthly"]),
+               "next_step": ("Call get_payment_methods." if not cart.blockers()
+                             else "Resolve the blockers listed on the cart, then call get_payment_methods.")}
+    return respond(ctx, payload, uri="ui://telekom/cart.html",
+                   markdown=md_cart(pub), widget_data=payload)
 
 
 @apps.tool(
@@ -745,7 +955,7 @@ def update_cart(cart_id: str, tariff_id: str = "", device_id: str = "", name: st
                  "whereas a SEPA mandate must be granted to the creditor directly."),
     annotations=WRITE,
 )
-def get_payment_methods(cart_id: str, tokenise: bool = False, card_last4: str = "") -> dict[str, Any]:
+def get_payment_methods(ctx: Context, cart_id: str, tokenise: bool = False, card_last4: str = "") -> dict[str, Any]:
     """List payment methods, and optionally issue a scoped payment token.
 
     Args:
@@ -778,7 +988,9 @@ def get_payment_methods(cart_id: str, tokenise: bool = False, card_last4: str = 
     else:
         result["next_step"] = ("Ask the customer to confirm payment by card and for the last four digits, "
                                "then call this tool again with tokenise=true.")
-    return result
+    return respond(ctx, result, uri="ui://telekom/payment.html",
+                   markdown=md_payment(methods, cart.totals(), result.get("token")),
+                   widget_data=result)
 
 
 @apps.tool(
@@ -790,7 +1002,7 @@ def get_payment_methods(cart_id: str, tokenise: bool = False, card_last4: str = 
                  "customer's behalf or in a single batch without asking."),
     annotations=WRITE,
 )
-def get_required_consents(cart_id: str, grant: list[str] | None = None) -> dict[str, Any]:
+def get_required_consents(ctx: Context, cart_id: str, grant: list[str] | None = None) -> dict[str, Any]:
     """Fetch and optionally record consents.
 
     Args:
@@ -810,7 +1022,7 @@ def get_required_consents(cart_id: str, grant: list[str] | None = None) -> dict[
               "mandatory": CONSENTS[cid].get("mandatory") == "true",
               "granted": cid in cart.consents} for cid in required]
     outstanding = [i["id"] for i in items if i["mandatory"] and not i["granted"]]
-    return {
+    payload = {
         "cart_id": cart_id, "consents": items, "totals": cart.totals(),
         "outstanding": outstanding,
         "next_step": ("Call complete_order." if not outstanding else
@@ -818,6 +1030,8 @@ def get_required_consents(cart_id: str, grant: list[str] | None = None) -> dict[
                       "grant=[...] for the ones they agree to."),
         "order_button_label": "Zahlungspflichtig bestellen",
     }
+    return respond(ctx, payload, uri="ui://telekom/consents.html",
+                   markdown=md_consents(items, cart.totals()), widget_data=payload)
 
 
 @apps.tool(
@@ -829,7 +1043,7 @@ def get_required_consents(cart_id: str, grant: list[str] | None = None) -> dict[
                  "mandatory consent granted."),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
 )
-def complete_order(cart_id: str) -> dict[str, Any]:
+def complete_order(ctx: Context, cart_id: str) -> dict[str, Any]:
     """Conclude the contract and return the order confirmation.
 
     Args:
@@ -867,20 +1081,24 @@ def complete_order(cart_id: str) -> dict[str, Any]:
     if d and d.get("name") != "No device":
         summary += f" with {d.get('name')}"
 
-    return {
-        "order": {
-            "order_id": cart.order_id, "summary": summary,
-            "monthly": tot["monthly"], "one_off": tot["one_off"],
-            "term": f"{as_int(t.get('term_months')) if t else 24}-month term",
-            "status_lines": status, "qr": qr_svg,
-        },
+    order = {
+        "order_id": cart.order_id, "summary": summary,
+        "monthly": tot["monthly"], "one_off": tot["one_off"],
+        "monthly_spoken": money_spoken(tot["monthly"]),
+        "term": f"{as_int(t.get('term_months')) if t else 24}-month term",
+        "status_lines": status, "qr": qr_svg,
+    }
+    payload = {
+        "order": order,
         "order_id": cart.order_id,
         "consents_recorded": len(cart.consents),
         "app_download_url": APP_DOWNLOAD_URL,
         "channel_attribution": "agent",
-        "next_step": ("Tell the customer the order is confirmed and point at the QR code in the widget "
-                      "for installing MeinMagenta to track it. Do not restate the prices."),
+        "next_step": ("Tell the customer the order is confirmed and show them display_markdown. "
+                      "Point at the QR code for installing MeinMagenta to track the order."),
     }
+    return respond(ctx, payload, uri="ui://telekom/order.html",
+                   markdown=md_order(order), widget_data=payload)
 
 
 # --------------------------------------------------------------------------
@@ -895,8 +1113,19 @@ mcp = MCPServer(
         "A demonstration Telekom commerce server for mobile, fixed-line and TV/OTT acquisition. "
         "Typical order of operations: search_tariffs → get_tariff_details → search_devices "
         "(mobile only) → create_cart → update_cart (customer details) → get_payment_methods → "
-        "get_required_consents → complete_order. Prices are returned in euro cents; always show "
-        "the widget rather than restating prices in prose. This is demo data, not a live catalogue."
+        "get_required_consents → complete_order.\n\n"
+        "Display contract. Every tool returns `display_markdown`, Telekom's own rendering of that "
+        "result, and `display_note`, which says what to do with it. When a widget is on screen, do "
+        "not restate prices. Otherwise reproduce `display_markdown` verbatim — it is the priced "
+        "offer as Telekom words it, including the minimum-term and post-term footnotes.\n\n"
+        "Price integrity. Prices are euro cents and authoritative exactly as returned. Never sum "
+        "components, apply a discount, convert a currency or round a figure yourself; quote only "
+        "figures present in the tool result. Do not describe MagentaEINS as applied — it is a "
+        "conditional saving that needs a Telekom fixed line at the same address. Do not call a "
+        "payment complete on the strength of a token: the token is an authorisation, and the order "
+        "is placed only when complete_order returns an order_id.\n\n"
+        "On voice surfaces read the *_spoken fields rather than the cent values, keep lists to "
+        "three items, and never read an ID aloud. This is demo data, not a live catalogue."
     ),
     extensions=[apps],
 )
@@ -962,10 +1191,15 @@ if __name__ == "__main__":
     ap.add_argument("--http", action="store_true", help="serve over streamable HTTP instead of stdio")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--no-mcp-ui", action="store_true",
+                    help="omit the in-band ui:// widget resource (same as TELEKOM_MCP_UI=0)")
     args = ap.parse_args()
+    if args.no_mcp_ui:
+        MCP_UI_ENABLED = False
     if args.http:
         print(f"Telekom demo MCP server on http://{args.host}:{args.port}/mcp")
         print(f"  {len(TARIFFS)} tariffs · {len(DEVICES)} devices · {len(CONSENTS)} consents")
+        print(f"  in-band MCP-UI resource: {'on' if MCP_UI_ENABLED else 'off'}")
         mcp.run(transport="streamable-http", host=args.host, port=args.port)
     else:
         mcp.run()
