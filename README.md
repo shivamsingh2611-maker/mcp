@@ -78,12 +78,12 @@ upgrade the Render service to a paid instance (still the same `render.yaml`).
 ## Connect it
 
 **Claude** — Settings → Connectors → Add custom connector → paste the `/mcp` URL.
-All nine tools and the three prompt templates work. The MCP Apps widget does
-*not* render (see "Where the UI renders" below); the priced tables come through
-as `display_markdown` instead.
+Claude and Claude Desktop both support MCP Apps, so the widgets render inline.
+After changing a widget, remove and re-add the connector: hosts cache `ui://`
+resources and will otherwise keep serving the old view.
 
-**ChatGPT** — Settings → Connectors → Create, same URL. Same position as Claude:
-tools work, widget rendering depends on Apps SDK support in your workspace.
+**ChatGPT** — Settings → Connectors → Create, same URL. Tools work; widget
+rendering depends on Apps SDK support in your workspace.
 
 **Gemini** — add as an MCP server in the Gemini CLI or any UCP/MCP-capable client.
 
@@ -98,9 +98,16 @@ renders everywhere today:
 
 | Mechanism | How it travels | Renders in |
 |---|---|---|
-| MCP Apps (SEP-2133) | `_meta.ui.resourceUri` on the tool + a separate `ui://` resource, gated by capability negotiation | Nothing yet — the `extensions` capability is only carried on wire revision `2026-07-28`, which the `initialize` handshake cannot reach, so `client_supports_apps()` is false in Claude and ChatGPT |
-| MCP-UI (in-band) | an `EmbeddedResource` with a `ui://` URI and `text/html`, inside the tool result's own `content` | MCP-UI-aware clients (MCPJam inspector, Goose, custom web chat) |
+| MCP Apps (SEP-1865) | `_meta.ui.resourceUri` on the tool + a separate `ui://` resource the host fetches and renders in a sandboxed iframe | Claude, Claude Desktop, VS Code Copilot, M365 Copilot, Goose, Postman, MCPJam, Archestra |
+| MCP-UI (in-band) | an `EmbeddedResource` with a `ui://` URI and `text/html`, inside the tool result's own `content` | MCP-UI-aware clients and custom web chat |
 | `display_markdown` | a plain field in every tool result | Everywhere, including voice |
+
+The MCP Apps lifecycle is strict and easy to get wrong. The view MUST send
+`ui/initialize` **with** `protocolVersion`, `appCapabilities` and `clientInfo`,
+and MUST then send `ui/notifications/initialized` — until the host sees that
+notification it is forbidden from sending anything back, so
+`ui/notifications/tool-result` never arrives and the view renders empty. That
+bug is what kept every widget here blank; see `BRIDGE` in `server.py`.
 
 The in-band copy is a complete, standalone HTML document with that call's data
 already baked in, so it needs no postMessage bridge from the host. Disable it
