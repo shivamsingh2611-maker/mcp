@@ -26,6 +26,8 @@ import segno
 from mcp.server.apps import Apps, ResourceCsp, client_supports_apps
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, EmbeddedResource, TextContent, TextResourceContents, ToolAnnotations
+from starlette.requests import Request
+from starlette.responses import HTMLResponse
 
 HERE = Path(__file__).parent
 CATALOGUE = HERE / "catalogue"
@@ -36,6 +38,16 @@ APP_DOWNLOAD_URL = "https://www.telekom.de/meinmagenta-app"
 # how MCP-UI clients render. Costs a few KB per call on clients that ignore it;
 # set TELEKOM_MCP_UI=0 to send structured output only.
 MCP_UI_ENABLED = os.environ.get("TELEKOM_MCP_UI", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# Public origin this server is reachable on, used to build the hand-off cart link.
+# Render sets RENDER_EXTERNAL_URL itself; --http fills it in locally.
+PUBLIC_BASE_URL = (os.environ.get("TELEKOM_PUBLIC_URL")
+                   or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+
+
+def cart_url(cart_id: str) -> str | None:
+    """The browser hand-off URL for a cart, or None when the origin is unknown."""
+    return f"{PUBLIC_BASE_URL}/cart/{cart_id}" if PUBLIC_BASE_URL else None
 
 # --------------------------------------------------------------------------
 # Markdown catalogue parsing
@@ -258,26 +270,62 @@ background:var(--bg);color:var(--grey);margin-left:6px}
 .empty-state{font-size:12.5px;color:var(--grey);padding:4px}
 """
 
-# Defensive bridge: MCP Apps hosts deliver the tool result to the iframe. The
-# exact surface still differs between hosts, so try the known shapes in turn and
-# fall back to the catalogue snapshot embedded at build time.
+# MCP Apps host bridge (SEP-1865, spec revision 2026-01-26).
+#
+# The lifecycle is strict and the previous hand-rolled version got it wrong,
+# which is why nothing ever rendered: the View MUST send `ui/initialize` *with*
+# params, and MUST then send `ui/notifications/initialized`. Until the host sees
+# that notification it is forbidden from sending anything to the View — so no
+# `ui/notifications/tool-result` ever arrived and every widget sat on its
+# build-time snapshot (which is null for cart/order, i.e. a blank card).
+#
+# FALLBACK is the data baked in at build time (catalogue snapshot) or, for the
+# in-band copy, this call's own payload. It paints immediately when it carries
+# something; the authoritative repaint comes from `ui/notifications/tool-result`.
 BRIDGE = """
-function paint(d){try{render(d||{})}catch(e){
-document.body.innerHTML='<div class="card"><div class="bd empty-state">'+e.message+'</div></div>'}}
+var PAINTED=false;
+function paint(d){
+  if(!d)return false;
+  try{render(d)}
+  catch(e){R.innerHTML='<div class="card"><div class="bd empty-state">'+e.message+'</div></div>';return true}
+  if(!R.innerHTML.trim())return false;
+  PAINTED=true;return true;
+}
+function dataFrom(r){
+  if(!r)return null;
+  if(r.structuredContent)return r.structuredContent;
+  var c=r.content||[];
+  for(var i=0;i<c.length;i++){
+    if(c[i]&&c[i].type==='text'&&c[i].text){try{return JSON.parse(c[i].text)}catch(e){}}
+  }
+  return null;
+}
 function boot(){
-  var w=window;
-  var direct=(w.mcp&&(w.mcp.toolOutput||w.mcp.toolResult))||(w.openai&&w.openai.toolOutput)||w.__TOOL_OUTPUT__;
-  if(direct){paint(direct);return}
-  var done=false;
+  var w=window,ID=1;
+  paint(FALLBACK);
   w.addEventListener('message',function(e){
-    if(done||!e.data)return;
-    var d=e.data;
-    var p=d.toolOutput||d.structuredContent||(d.params&&(d.params.toolOutput||d.params.structuredContent))
-        ||(d.result&&(d.result.structuredContent||d.result.toolOutput));
-    if(p){done=true;paint(p)}
+    var m=e.data;
+    if(!m||m.jsonrpc!=='2.0')return;
+    if(m.id===ID&&m.result){
+      // Handshake acknowledged. The host may only push data once it sees this.
+      w.parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized'},'*');
+      return;
+    }
+    if(m.method==='ui/notifications/tool-result'){
+      var d=dataFrom(m.params);
+      if(d)paint(d);
+    }
   });
-  try{w.parent.postMessage({jsonrpc:"2.0",id:1,method:"ui/initialize"},'*')}catch(e){}
-  setTimeout(function(){if(!done)paint(FALLBACK)},600);
+  try{
+    w.parent.postMessage({jsonrpc:'2.0',id:ID,method:'ui/initialize',params:{
+      protocolVersion:'2026-01-26',
+      appCapabilities:{availableDisplayModes:['inline']},
+      clientInfo:{name:'telekom-commerce-view',version:'1.0.0'}
+    }},'*');
+  }catch(e){}
+  setTimeout(function(){
+    if(!PAINTED)R.innerHTML='<div class="card"><div class="bd empty-state">Waiting for data from the assistant…</div></div>';
+  },1500);
 }
 if(document.readyState!=='loading')boot();else document.addEventListener('DOMContentLoaded',boot);
 """
@@ -309,6 +357,17 @@ ${foot?`<div class="ft">${esc(foot)}</div>`:''}</div>`;
 """
 
 apps = Apps()
+
+
+def ui_tool(*, resource_uri: str, **kwargs: Any):
+    """Register a UI-bound tool, advertising the link both ways hosts read it.
+
+    `Apps.tool` stamps the current `_meta.ui.resourceUri`. The flat
+    `_meta["ui/resourceUri"]` is deprecated in the 2026-01-26 spec but the
+    reference servers still ship it, so hosts that only read the old key still
+    find the view.
+    """
+    return apps.tool(resource_uri=resource_uri, meta={"ui/resourceUri": resource_uri}, **kwargs)
 
 # ---- tariff picker -------------------------------------------------------
 
@@ -547,7 +606,11 @@ def respond(ctx: Context, payload: dict[str, Any], *, uri: str, markdown: str,
     payload = dict(payload)
     payload["display_markdown"] = markdown
     payload["display_note"] = (
-        "The widget already shows this. Do not restate prices in prose."
+        # Never suppress pricing outright: if the view fails to paint, total
+        # suppression would leave the customer with no prices at all.
+        "A widget is rendering this result, so keep prose short and do not repeat every "
+        "figure — but still name the headline monthly price so the answer stands alone. "
+        + PRICE_RULES
         if client_supports_apps(ctx) else
         "No widget is on screen in this client. Show the customer display_markdown "
         "verbatim — it is Telekom's own rendering. " + PRICE_RULES
@@ -623,7 +686,7 @@ def md_device_detail(d: dict[str, Any]) -> str:
     return "\n".join(out + ["", "_The same handset is priced differently on each tariff._"])
 
 
-def md_cart(cart: dict[str, Any]) -> str:
+def md_cart(cart: dict[str, Any], url: str | None = None) -> str:
     tot = cart.get("totals", {})
     out = ["**Your cart**", "", "| Item | Per month |", "|---|---|"]
     if cart.get("tariff"):
@@ -642,6 +705,9 @@ def md_cart(cart: dict[str, Any]) -> str:
                     f"reduces this by {money(cart['magenta_eins_discount'])} per month."]
     if cart.get("blockers"):
         out += ["", "**Still needed before this order can be placed**"] + [f"- {b}" for b in cart["blockers"]]
+    if url:
+        out += ["", f"**[Open your cart on telekom.de →]({url})** — review it and complete the order "
+                    "in your browser."]
     return "\n".join(out)
 
 
@@ -688,7 +754,7 @@ READ = ToolAnnotations(readOnlyHint=True)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False)
 
 
-@apps.tool(
+@ui_tool(
     resource_uri="ui://telekom/tariffs.html",
     name="search_tariffs",
     title="Search tariffs",
@@ -738,7 +804,7 @@ def search_tariffs(ctx: Context, line_type: str = "", min_data_gb: int = 0, max_
                    markdown=md_tariff_rows(out, label), widget_data=payload)
 
 
-@apps.tool(
+@ui_tool(
     resource_uri="ui://telekom/tariff-detail.html",
     name="get_tariff_details",
     title="Tariff detail",
@@ -773,7 +839,7 @@ def get_tariff_details(ctx: Context, tariff_id: str) -> dict[str, Any]:
                    markdown=md_tariff_detail(tariff), widget_data=payload)
 
 
-@apps.tool(
+@ui_tool(
     resource_uri="ui://telekom/devices.html",
     name="search_devices",
     title="Search devices",
@@ -820,7 +886,7 @@ def search_devices(ctx: Context, tariff_id: str, brand: str = "", in_stock_only:
                    markdown=md_devices(out, title), widget_data=payload)
 
 
-@apps.tool(
+@ui_tool(
     resource_uri="ui://telekom/device-detail.html",
     name="get_device_details",
     title="Device detail",
@@ -850,7 +916,7 @@ def get_device_details(ctx: Context, device_id: str) -> dict[str, Any]:
                    markdown=md_device_detail(device), widget_data=payload)
 
 
-@apps.tool(
+@ui_tool(
     resource_uri="ui://telekom/cart.html",
     name="create_cart",
     title="Create cart",
@@ -876,21 +942,24 @@ def create_cart(ctx: Context, tariff_id: str, device_id: str = "") -> dict[str, 
     cart = Cart(cart_id="crt_" + uuid.uuid4().hex[:8], tariff_id=tariff_id, device_id=device_id or None)
     CARTS[cart.cart_id] = cart
     pub = cart.public()
+    url = cart_url(cart.cart_id)
     payload = {
         "cart": pub, "show_customer": True,
+        "checkout_url": url,
         "monthly_total_spoken": money_spoken(pub["totals"]["monthly"]),
         "suggested_additions": ([{"type": "bundle_discount", "product": "MagentaEINS",
                                   "saves_monthly": pub["magenta_eins_discount"],
                                   "condition": "add_fixed_line_same_address"}]
                                 if pub["magenta_eins_discount"] else []),
-        "next_step": ("Call update_cart with the customer's name, date of birth, delivery address "
-                      "and phone number. Ask for them conversationally, one or two at a time."),
+        "next_step": ("Optionally call update_cart to record the customer's name, date of birth, "
+                      "delivery address and phone number, then give them checkout_url to finish in "
+                      "their browser. Do not invent a different link."),
     }
     return respond(ctx, payload, uri="ui://telekom/cart.html",
-                   markdown=md_cart(pub), widget_data=payload)
+                   markdown=md_cart(pub, url), widget_data=payload)
 
 
-@apps.tool(
+@ui_tool(
     resource_uri="ui://telekom/cart.html",
     name="update_cart",
     title="Update cart",
@@ -938,15 +1007,16 @@ def update_cart(ctx: Context, cart_id: str, tariff_id: str = "", device_id: str 
         if value:
             cart.customer[key] = value.strip()
     pub = cart.public()
-    payload = {"cart": pub, "show_customer": True,
+    url = cart_url(cart.cart_id)
+    payload = {"cart": pub, "show_customer": True, "checkout_url": url,
                "monthly_total_spoken": money_spoken(pub["totals"]["monthly"]),
-               "next_step": ("Call get_payment_methods." if not cart.blockers()
-                             else "Resolve the blockers listed on the cart, then call get_payment_methods.")}
+               "next_step": ("Give the customer checkout_url so they can review the cart and complete "
+                             "the order in their browser. Hand over the link as returned.")}
     return respond(ctx, payload, uri="ui://telekom/cart.html",
-                   markdown=md_cart(pub), widget_data=payload)
+                   markdown=md_cart(pub, url), widget_data=payload)
 
 
-@apps.tool(
+@ui_tool(
     resource_uri="ui://telekom/payment.html",
     name="get_payment_methods",
     title="Payment methods",
@@ -993,7 +1063,7 @@ def get_payment_methods(ctx: Context, cart_id: str, tokenise: bool = False, card
                    widget_data=result)
 
 
-@apps.tool(
+@ui_tool(
     resource_uri="ui://telekom/consents.html",
     name="get_required_consents",
     title="Required consents",
@@ -1034,7 +1104,7 @@ def get_required_consents(ctx: Context, cart_id: str, grant: list[str] | None = 
                    markdown=md_consents(items, cart.totals()), widget_data=payload)
 
 
-@apps.tool(
+@ui_tool(
     resource_uri="ui://telekom/order.html",
     name="complete_order",
     title="Place the order",
@@ -1112,8 +1182,13 @@ mcp = MCPServer(
     instructions=(
         "A demonstration Telekom commerce server for mobile, fixed-line and TV/OTT acquisition. "
         "Typical order of operations: search_tariffs → get_tariff_details → search_devices "
-        "(mobile only) → create_cart → update_cart (customer details) → get_payment_methods → "
-        "get_required_consents → complete_order.\n\n"
+        "(mobile only) → create_cart → update_cart (customer details, optional).\n\n"
+        "Ending the journey. The conversation ends at a built cart: hand the customer the "
+        "`checkout_url` the cart tools return so they can review and order in their browser. Pass "
+        "that link through exactly as returned and never construct one yourself. The checkout tools "
+        "(get_payment_methods, get_required_consents, complete_order) still exist for the in-chat "
+        "compliance walkthrough, but only use them if the customer explicitly asks to complete the "
+        "order inside the conversation.\n\n"
         "Display contract. Every tool returns `display_markdown`, Telekom's own rendering of that "
         "result, and `display_note`, which says what to do with it. When a widget is on screen, do "
         "not restate prices. Otherwise reproduce `display_markdown` verbatim — it is the priced "
@@ -1129,6 +1204,167 @@ mcp = MCPServer(
     ),
     extensions=[apps],
 )
+
+
+# --------------------------------------------------------------------------
+# Browser hand-off: the cart as a real web page
+# --------------------------------------------------------------------------
+#
+# The agent journey ends at a built cart and hands the customer a link. The page
+# below is served from this same process at /cart/{cart_id}, in the Telekom
+# design language the widgets use, so the hand-off looks like Telekom rather
+# than like a chat transcript.
+
+def esc(value: Any) -> str:
+    return (str(value if value is not None else "")
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+CART_PAGE_CSS = """
+:root{--m:#E20074;--mdk:#9D1046;--mbg:#FDF2F8;--ink:#17171A;--grey:#6E6E73;
+--faint:#A1A1A8;--line:#E4E4E7;--bg:#F4F4F5;--green:#15803D;--amber:#B45309;--ambg:#FEF3C7}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Inter,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);
+color:var(--ink);line-height:1.5;font-size:15px}
+header{background:var(--m);color:#fff;padding:14px 20px;display:flex;align-items:center;gap:12px}
+.logo{display:flex;gap:3px;align-items:center}
+.logo i{width:7px;height:7px;background:#fff;display:block;border-radius:1px}
+.logo b{font-size:16px;font-weight:700;letter-spacing:.3px;margin-left:5px}
+header .sp{margin-left:auto;font-size:13px;opacity:.92}
+main{max-width:720px;margin:0 auto;padding:20px 16px 56px}
+h1{font-size:22px;font-weight:700;margin-bottom:4px}
+.sub{color:var(--grey);font-size:13.5px;margin-bottom:18px}
+.card{background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:16px}
+.card h2{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;
+color:var(--grey);padding:14px 18px 0}
+.line{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding:14px 18px;
+border-bottom:1px solid var(--line)}
+.line:last-child{border-bottom:none}
+.line .nm{font-size:15.5px;font-weight:600}
+.line .dt{font-size:12.5px;color:var(--grey);margin-top:2px}
+.line .pr{text-align:right;white-space:nowrap;font-size:15.5px;font-weight:700}
+.line .pr small{display:block;font-size:11px;font-weight:500;color:var(--grey);margin-top:1px}
+.sum{padding:14px 18px}
+.sum .row{display:flex;justify-content:space-between;font-size:14px;padding:4px 0;color:var(--grey)}
+.sum .row span:last-child{color:var(--ink)}
+.sum .tot{display:flex;justify-content:space-between;align-items:baseline;
+border-top:2px solid var(--line);margin-top:10px;padding-top:12px}
+.sum .tot span{font-size:16px;font-weight:700}
+.sum .tot b{font-size:26px;font-weight:700;color:var(--m)}
+.promo{border:1.5px solid var(--m);background:var(--mbg);border-radius:11px;padding:13px 15px;margin:0 18px 16px}
+.promo .h{font-size:13.5px;font-weight:700;color:var(--mdk);margin-bottom:3px}
+.promo .b{font-size:13px}
+.note{font-size:12.5px;color:var(--grey);background:var(--bg);border-radius:8px;padding:10px 12px;margin:0 18px 16px}
+.warn{background:var(--ambg);border:1.5px solid var(--amber);border-radius:10px;padding:12px 14px;
+margin:0 18px 16px;font-size:13px;color:#5C3A08}
+.warn b{display:block;color:var(--amber);margin-bottom:4px}
+.f{padding:10px 18px}
+.f label{display:block;font-size:11.5px;font-weight:600;color:var(--grey);margin-bottom:3px}
+.f .v{border:1.5px solid var(--line);border-radius:9px;padding:10px 12px;font-size:14.5px;background:#FCFCFD}
+.f .v.empty{color:var(--faint);font-style:italic}
+.cta{padding:4px 18px 20px}
+.cta button{width:100%;background:var(--m);color:#fff;border:0;border-radius:10px;padding:15px;
+font-size:16px;font-weight:700;cursor:pointer;font-family:inherit}
+.cta button:disabled{background:var(--faint);cursor:not-allowed}
+.cta .hint{text-align:center;font-size:12px;color:var(--grey);margin-top:9px}
+footer{max-width:720px;margin:0 auto;padding:0 18px 40px;font-size:11.5px;color:var(--faint)}
+@media(max-width:520px){main{padding:14px 10px 40px}h1{font-size:19px}.sum .tot b{font-size:22px}}
+"""
+
+
+def cart_page(cart: dict[str, Any]) -> str:
+    """Render a cart as a standalone Telekom-styled checkout page."""
+    t, d, tot = cart.get("tariff"), cart.get("device"), cart.get("totals", {})
+    lines = []
+    if t:
+        lines.append(f"""<div class="line"><div><div class="nm">{esc(t['name'])}</div>
+        <div class="dt">{esc(t.get('line_type', '')).title()} · 24-month minimum term</div></div>
+        <div class="pr">{money(t['monthly'])}<small>per month</small></div></div>""")
+    if d and d.get("name") != "No device":
+        lines.append(f"""<div class="line"><div><div class="nm">{esc(d['name'])}</div>
+        <div class="dt">{esc(d.get('storage') or '')} {esc(d.get('colour') or '')}</div></div>
+        <div class="pr">{money(d['monthly'])}<small>per month</small></div></div>""")
+    if not lines:
+        lines.append('<div class="line"><div class="nm">Your cart is empty</div></div>')
+
+    cu = cart.get("customer") or {}
+    fields = ""
+    if cu:
+        def fld(label, key):
+            v = cu.get(key)
+            return (f'<div class="f"><label>{label}</label>'
+                    f'<div class="v {"" if v else "empty"}">{esc(v) if v else "not provided yet"}</div></div>')
+        fields = ('<div class="card"><h2>Your details</h2>'
+                  + fld("Full name", "name") + fld("Date of birth", "dob")
+                  + fld("Delivery address", "address") + fld("Phone", "phone") + "</div>")
+
+    promo = ""
+    if cart.get("magenta_eins_discount"):
+        promo = (f'<div class="promo"><div class="h">You qualify for MagentaEINS</div>'
+                 f'<div class="b">Adding a Telekom fixed line at your address reduces this by '
+                 f'{money(cart["magenta_eins_discount"])} per month, for as long as both contracts run.</div></div>')
+
+    after = tot.get("monthly_after_24")
+    after_note = (f'<div class="note">From month 25 the monthly total becomes {money(after)}.</div>'
+                  if after and after != tot.get("monthly") else "")
+
+    # `blockers` is written for the agent ("Call update_cart with customer details"),
+    # so the customer-facing page names the missing details instead.
+    missing = [label for key, label in (("name", "your full name"), ("dob", "your date of birth"),
+                                        ("address", "a delivery address"), ("phone", "a phone number"))
+               if not cu.get(key)]
+    blocker_box = ""
+    if missing:
+        items = "".join(f"<li>{esc(m)}</li>" for m in missing)
+        blocker_box = (f'<div class="warn"><b>We still need a few details</b>'
+                       f'<ul style="margin:0 0 0 18px">{items}</ul></div>')
+
+    one_off = (f'<div class="row"><span>One-off charges</span><span>{money(tot.get("one_off", 0))}</span></div>'
+               if tot.get("one_off") else "")
+
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Your Telekom cart</title><style>{CART_PAGE_CSS}</style></head><body>
+<header><span class="logo"><i></i><i></i><b>Telekom</b></span><span class="sp">Warenkorb</span></header>
+<main>
+  <h1>Your cart</h1>
+  <div class="sub">Cart {esc(cart.get('cart_id'))} · prices include VAT</div>
+  <div class="card">
+    <h2>Your selection</h2>
+    {''.join(lines)}
+    <div class="sum">
+      <div class="row"><span>Monthly, months 1–24</span><span>{money(tot.get('monthly', 0))}</span></div>
+      {one_off}
+      <div class="tot"><span>Monthly total</span><b>{money(tot.get('monthly', 0))}</b></div>
+    </div>
+  </div>
+  {promo}{after_note}{blocker_box}
+  {fields}
+  <div class="card"><div class="cta">
+    <button disabled>Zahlungspflichtig bestellen</button>
+    <div class="hint">Demo only — no order is placed and no payment is taken.</div>
+  </div></div>
+</main>
+<footer>Demo environment. Prices, availability and device line-up are illustrative and do not
+reflect a live Telekom offer. Full price information per TKG §54 is in the Produktinformationsblatt.</footer>
+</body></html>"""
+
+
+@mcp.custom_route("/cart/{cart_id}", methods=["GET"])
+async def serve_cart(request: Request) -> HTMLResponse:
+    """Serve a cart as a web page for the browser hand-off."""
+    cart = CARTS.get(request.path_params["cart_id"])
+    if not cart:
+        return HTMLResponse(
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Cart not found</title>"
+            f"<style>{CART_PAGE_CSS}</style></head><body>"
+            "<header><span class='logo'><i></i><i></i><b>Telekom</b></span></header>"
+            "<main><h1>This cart has expired</h1><div class='sub'>Carts are held in memory for the "
+            "life of the server process, so a restart clears them. Ask the assistant to build a new "
+            "one.</div></main></body></html>",
+            status_code=404,
+        )
+    return HTMLResponse(cart_page(cart.public()))
 
 
 # ---- prompt templates ----------------------------------------------------
@@ -1197,7 +1433,11 @@ if __name__ == "__main__":
     if args.no_mcp_ui:
         MCP_UI_ENABLED = False
     if args.http:
+        if not PUBLIC_BASE_URL:
+            shown = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+            PUBLIC_BASE_URL = f"http://{shown}:{args.port}"
         print(f"Telekom demo MCP server on http://{args.host}:{args.port}/mcp")
+        print(f"  cart hand-off pages at {PUBLIC_BASE_URL}/cart/<cart_id>")
         print(f"  {len(TARIFFS)} tariffs · {len(DEVICES)} devices · {len(CONSENTS)} consents")
         print(f"  in-band MCP-UI resource: {'on' if MCP_UI_ENABLED else 'off'}")
         mcp.run(transport="streamable-http", host=args.host, port=args.port)
